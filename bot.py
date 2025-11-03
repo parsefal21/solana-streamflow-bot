@@ -4,7 +4,6 @@ import aiohttp
 import asyncio
 import logging
 from datetime import datetime, timezone
-from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -13,11 +12,18 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from dotenv import load_dotenv
 
 # === Настройка ===
-load_dotenv()
+load_dotenv()  # локально, для Railway переменные через Environment Variables
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+if not TELEGRAM_TOKEN:
+    raise ValueError("❌ TELEGRAM_TOKEN не задан! Задайте через Environment Variables на Railway.")
+if not TELEGRAM_CHAT_ID:
+    raise ValueError("❌ TELEGRAM_CHAT_ID не задан! Задайте через Environment Variables на Railway.")
 
 RPC_URL = "https://api.mainnet-beta.solana.com"
 STREAMFLOW_PROGRAM = "7AnS5vRWuNNAh4bKf7ZLfXoZKvK2ekBvZqH6hZkz3xRi"
@@ -34,7 +40,7 @@ async def send_message(bot, text):
     await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="HTML")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Бот активен! Мониторинг Pump.fun токенов запущен.")
+    await update.message.reply_text("✅ Бот активен! Мониторинг PumpFun токенов запущен.")
 
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
@@ -93,7 +99,7 @@ async def get_market_cap_pumpfun(session, symbol):
                 data = await resp.json()
                 return float(data.get("market_cap", 0))
     except Exception as e:
-        logger.warning(f"Pump.fun API ошибка: {e}")
+        logger.warning(f"PumpFun API ошибка: {e}")
     return 0
 
 async def get_market_cap_coingecko(session, symbol):
@@ -114,12 +120,12 @@ async def format_lock_message(lock):
     total = lock.get("total_supply", 1)
     percent = (locked / total * 100) if total else 0
     msg = (
-        f"🚀 <b>Новый Pump.fun токен на Streamflow!</b>\n\n"
+        f"🚀 <b>Новый PumpFun токен на Streamflow!</b>\n\n"
         f"💎 <b>{lock.get('name')}</b> ({lock.get('symbol')})\n"
         f"💰 Market Cap: ${market_cap:,.0f}\n"
         f"🔒 Заблокировано: {locked:,.0f} токенов ({percent:.2f}% от supply)\n"
         f"⏱️ Создан: {lock.get('created_ago')}\n"
-        f"🔗 <a href='https://solscan.io/tx/{lock.get('tx_hash')}'>Посмотреть в Solscan</a>"
+        f"🔗 <a href='https://solscan.io/tx/{lock.get('tx_hash')}'>Solscan</a>"
     )
     return msg
 
