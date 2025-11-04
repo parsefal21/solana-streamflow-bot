@@ -1,3 +1,6 @@
-python-telegram-bot==20.5
-aiohttp==3.9.5
-python-dotenv==1.0.0
+aiohttp
+requests
+python-dotenv
+solana
+base58
+python-telegram-bot==21.10
