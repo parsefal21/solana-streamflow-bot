@@ -3,142 +3,187 @@ import os
 import aiohttp
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
+from solana.rpc.async_api import AsyncClient
+from telegram import Bot
 from dotenv import load_dotenv
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --------------------------------------------
-# Настройки логирования
-# --------------------------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# --------------------------------------------
-# Загрузка .env и переменных окружения
-# --------------------------------------------
+# =====================================
+# CONFIG
+# =====================================
 load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+STREAMFLOW_PROGRAM_ID = "4Nd1mW89xwYruwFjv6Jefzp2h2bxv3FrF7tqk3hECUf1"
+RPC_URL = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 
-if not TELEGRAM_TOKEN:
-    raise ValueError("Не найден TELEGRAM_TOKEN в .env")
+# =====================================
+# LOGGING
+# =====================================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# --------------------------------------------
-# Константы
-# --------------------------------------------
-STREAMFLOW_API = "https://public-api.streamflow.finance/v1/solana/mainnet/streams"
-GMGN_TERMINAL = "https://gmgn.ai/sol/token/"
-CHECK_INTERVAL = 60  # каждые 60 секунд проверка новых стримов
+# =====================================
+# TELEGRAM
+# =====================================
+bot = Bot(token=TELEGRAM_TOKEN)
 
-# Чтобы не дублировать сообщения
-seen_streams = set()
-
-# --------------------------------------------
-# Команды Telegram
-# --------------------------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Привет! Я бот, отслеживающий заблокированные токены на Streamflow.")
-
-async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Вы написали: {update.message.text}")
-
-# --------------------------------------------
-# Streamflow функции
-# --------------------------------------------
-async def fetch_streamflow_streams():
-    """Получает все активные стримы со Streamflow API"""
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(STREAMFLOW_API) as resp:
-                if resp.status != 200:
-                    logger.error(f"Ошибка Streamflow API: {resp.status}")
-                    return []
-                data = await resp.json()
-                return data.get("streams", [])
-        except Exception as e:
-            logger.error(f"Ошибка при запросе Streamflow API: {e}")
-            return []
-
-async def process_stream(stream, bot):
-    """Обрабатывает новый найденный стрим"""
-    stream_id = stream.get("id")
-    if not stream_id or stream_id in seen_streams:
-        return
-
-    seen_streams.add(stream_id)
-
-    token_mint = stream.get("mint")
-    sender = stream.get("sender")
-    recipient = stream.get("recipient")
-    total_amount = int(stream.get("amount", 0)) / (10 ** int(stream.get("mint_decimals", 9)))
-    start_time = datetime.fromtimestamp(int(stream.get("start_time", 0)), tz=timezone.utc)
-    now = datetime.now(timezone.utc)
-    age_days = (now - start_time).days
-
-    # Процент заблокированного супплая
-    locked_percent = None
-    if stream.get("total_supply"):
-        total_supply = int(stream.get("total_supply"))
-        if total_supply > 0:
-            locked_percent = round((int(stream.get("amount", 0)) / total_supply) * 100, 2)
-
-    token_name = stream.get("mint_symbol") or "Unknown"
-    token_symbol = stream.get("mint_symbol") or "???"
-
-    gmgn_link = f"{GMGN_TERMINAL}{token_mint}"
-
-    message_lines = [
-        "Новый заблокированный токен через Streamflow:",
-        f"• Название: {token_name}",
-        f"• Тикер: {token_symbol}",
-        f"• Адрес токена: {token_mint}",
-        f"• Отправитель: {sender}",
-        f"• Получатель: {recipient}",
-        f"• Количество: {total_amount:,.2f}",
-        f"• Возраст токена: {age_days} дн.",
-    ]
-
-    if locked_percent is not None:
-        message_lines.append(f"• Заблокировано от супплая: {locked_percent}%")
-
-    message_lines.append(f"\nСсылка: {gmgn_link}")
-
-    text = "\n".join(message_lines)
-
+async def send_telegram_message(text: str):
+    """Отправка сообщения в Telegram"""
     try:
-        await bot.send_message(chat_id=CHAT_ID, text=text)
-        logger.info(f"Отправлено уведомление о новом стриме: {stream_id}")
+        await bot.send_message(chat_id=CHAT_ID, text=text, disable_web_page_preview=True)
+        logger.info("Сообщение отправлено в Telegram")
     except Exception as e:
-        logger.error(f"Ошибка отправки сообщения: {e}")
+        logger.error(f"Ошибка при отправке сообщения: {e}")
 
-async def monitor_streamflow(bot):
-    """Основной цикл мониторинга"""
-    logger.info("Мониторинг Streamflow запущен")
+# =====================================
+# STREAMFLOW MONITOR
+# =====================================
+async def fetch_streamflow_transactions(before=None):
+    """Получить последние транзакции Streamflow"""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getSignaturesForAddress",
+        "params": [
+            STREAMFLOW_PROGRAM_ID,
+            {"limit": 10, "commitment": "confirmed", **({"before": before} if before else {})}
+        ]
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(RPC_URL, json=payload) as response:
+            data = await response.json()
+            return data.get("result", [])
+
+async def get_transaction_details(signature: str):
+    """Получить подробности транзакции"""
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getTransaction",
+        "params": [signature, {"encoding": "jsonParsed", "commitment": "confirmed"}]
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(RPC_URL, json=payload) as response:
+            data = await response.json()
+            return data.get("result", {})
+
+def extract_token_address(tx_data):
+    """Извлечь адрес токена"""
+    try:
+        instructions = tx_data.get("transaction", {}).get("message", {}).get("instructions", [])
+        for ix in instructions:
+            if isinstance(ix, dict):
+                accounts = ix.get("accounts", [])
+                for acc in accounts:
+                    if isinstance(acc, str) and len(acc) == 44:
+                        return acc
+    except Exception:
+        pass
+    return None
+
+async def fetch_token_metadata(mint: str):
+    """Получить данные токена через DexScreener"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}") as resp:
+                data = await resp.json()
+                if "pairs" in data and data["pairs"]:
+                    token = data["pairs"][0]
+                    info = {
+                        "name": token["baseToken"]["name"],
+                        "symbol": token["baseToken"]["symbol"],
+                        "mc": token.get("fdv", 0),
+                        "created": token.get("pairCreatedAt", 0),
+                        "url": f"https://gmgn.ai/sol/token/{mint}"
+                    }
+                    return info
+    except Exception as e:
+        logger.error(f"Ошибка при получении метаданных токена {mint}: {e}")
+    return None
+
+async def fetch_locked_supply_percentage(mint: str):
+    """Получить процент заблокированных токенов через Streamflow API"""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"https://api.streamflow.finance/v1/locks/{mint}") as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                total_locked = sum(float(lock.get("amount", 0)) for lock in data)
+                if not total_locked:
+                    return None
+                total_supply = sum(float(lock.get("tokenTotalSupply", 0)) for lock in data if lock.get("tokenTotalSupply"))
+                if total_supply > 0:
+                    percent = (total_locked / total_supply) * 100
+                    return round(percent, 2)
+    except Exception as e:
+        logger.error(f"Ошибка при получении процента блокировки: {e}")
+    return None
+
+def calculate_token_age(created_timestamp):
+    """Рассчитать возраст токена"""
+    if not created_timestamp:
+        return "неизвестно"
+    created_dt = datetime.fromtimestamp(created_timestamp / 1000)
+    delta_days = (datetime.utcnow() - created_dt).days
+    return f"{delta_days} дн."
+
+# =====================================
+# MAIN MONITOR LOOP
+# =====================================
+async def monitor_streamflow():
+    client = AsyncClient(RPC_URL)
+    last_checked = None
+    seen_sigs = set()
+
+    logger.info("Бот запущен и мониторит Streamflow")
+
     while True:
-        streams = await fetch_streamflow_streams()
-        for s in streams:
-            await process_stream(s, bot)
-        await asyncio.sleep(CHECK_INTERVAL)
+        try:
+            txs = await fetch_streamflow_transactions(before=last_checked)
+            for tx in txs:
+                sig = tx["signature"]
+                if sig in seen_sigs:
+                    continue
+                seen_sigs.add(sig)
 
-# --------------------------------------------
-# Основная функция
-# --------------------------------------------
-async def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+                tx_data = await get_transaction_details(sig)
+                token_address = extract_token_address(tx_data)
+                if not token_address:
+                    continue
 
-    # Команды Telegram
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
+                token_info = await fetch_token_metadata(token_address)
+                if not token_info:
+                    continue
 
-    # Запускаем мониторинг параллельно
-    asyncio.create_task(monitor_streamflow(app.bot))
+                locked_percent = await fetch_locked_supply_percentage(token_address)
+                locked_text = f"{locked_percent}%" if locked_percent else "неизвестно"
 
-    logger.info("Telegram бот запущен.")
-    await app.run_polling()
+                message = (
+                    f"Обнаружена блокировка токена через Streamflow\n\n"
+                    f"Имя: {token_info['name']}\n"
+                    f"Тикер: {token_info['symbol']}\n"
+                    f"Market Cap: {token_info['mc']:,}\n"
+                    f"Заблокировано: {locked_text}\n"
+                    f"Возраст токена: {calculate_token_age(token_info['created'])}\n\n"
+                    f"Подробнее: {token_info['url']}"
+                )
 
-# --------------------------------------------
-# Точка входа
-# --------------------------------------------
+                await send_telegram_message(message)
+
+            if txs:
+                last_checked = txs[-1]["signature"]
+
+            await asyncio.sleep(20)
+
+        except Exception as e:
+            logger.error(f"Ошибка мониторинга: {e}")
+            await asyncio.sleep(10)
+
+# =====================================
+# ENTRY POINT
+# =====================================
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(monitor_streamflow())
